@@ -1,5 +1,6 @@
 using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
+using EmailDownloader.Configuration;
 
 namespace EmailDownloader.Services;
 
@@ -13,11 +14,13 @@ public class EmailStorage
     private readonly string _storagePath;
     private readonly ConsoleLogger _logger;
     private readonly long _maxAttachmentBytes;
+    private readonly EmailProcessing _processingSettings;
 
-    public EmailStorage(string storagePath, long maxAttachmentSizeMB, ConsoleLogger logger)
+    public EmailStorage(string storagePath, long maxAttachmentSizeMB, ConsoleLogger logger, EmailProcessing processingSettings)
     {
         _storagePath = storagePath;
         _logger = logger;
+        _processingSettings = processingSettings;
         _maxAttachmentBytes = maxAttachmentSizeMB * 1024 * 1024;
 
         Directory.CreateDirectory(_storagePath);
@@ -65,64 +68,108 @@ public class EmailStorage
     {
         var attachments = new List<(string path, long size)>();
 
-        if (message?.Payload?.Parts == null)
+        if (message?.Payload == null)
             return attachments;
 
-        foreach (var part in message.Payload.Parts)
+        // Collect all candidate parts recursively
+        var parts = new List<MessagePart>();
+        void CollectParts(MessagePart p)
         {
-            if (string.IsNullOrEmpty(part.Filename) || part.MimeType == null)
-                continue; // Skip non-attachment parts
+            if (p == null) return;
+            parts.Add(p);
+            if (p.Parts != null)
+            {
+                foreach (var child in p.Parts)
+                    CollectParts(child);
+            }
+        }
 
+        CollectParts(message.Payload);
+
+        // Ensure message directory exists
+        string messageDir = Path.Combine(_storagePath, message.Id);
+        Directory.CreateDirectory(messageDir);
+
+        foreach (var part in parts)
+        {
             try
             {
-                // Skip text parts (they're not true attachments)
-                if (part.MimeType.StartsWith("text/"))
+                // Determine if this part represents an attachment
+                var hasFilename = !string.IsNullOrWhiteSpace(part.Filename);
+                var hasAttachmentId = !string.IsNullOrWhiteSpace(part.Body?.AttachmentId);
+                var hasInlineData = !string.IsNullOrWhiteSpace(part.Body?.Data);
+
+                if (!hasFilename && !hasAttachmentId && !hasInlineData)
+                    continue; // not an attachment
+
+                // Skip obvious text-only parts
+                var mime = part.MimeType ?? string.Empty;
+                if (mime.StartsWith("text/") && !hasAttachmentId && !hasInlineData)
                     continue;
 
-                // Get the attachment
-                string partId = part.PartId ?? string.Empty;
-                if (string.IsNullOrEmpty(partId))
-                    continue;
-
-                var attachmentRequest = gmailService.Users.Messages.Attachments.Get(
-                    "me", message.Id, partId);
-                var attachment = await attachmentRequest.ExecuteAsync();
-
-                if (attachment?.Data == null)
-                    continue;
-
-                byte[] attachmentData = DecodeBase64Url(attachment.Data);
-
-                // Check size limit
-                if (attachmentData.Length > _maxAttachmentBytes)
+                // Choose filename
+                string filename = part.Filename;
+                if (string.IsNullOrWhiteSpace(filename))
                 {
-                    _logger.LogWarning($"Attachment {part.Filename} exceeds size limit ({attachmentData.Length} bytes > {_maxAttachmentBytes} bytes). Skipping.");
-                    continue;
+                    // Create a sensible filename
+                    var ext = GetExtensionFromMime(mime);
+                    if (hasAttachmentId)
+                        filename = $"attachment_{part.Body!.AttachmentId}{ext}";
+                    else
+                        filename = $"part_{Guid.NewGuid()}{ext}";
                 }
 
-                // Store attachment in message subdirectory
-                string messageDir = Path.Combine(_storagePath, message.Id);
-                Directory.CreateDirectory(messageDir);
-
-                // Sanitize filename
-                string safeFilename = SanitizeFilename(part.Filename);
+                string safeFilename = SanitizeFilename(filename);
                 string attachmentPath = Path.Combine(messageDir, safeFilename);
 
                 // Handle filename collisions
                 int counter = 1;
                 string dirPath = Path.GetDirectoryName(attachmentPath) ?? messageDir;
                 string nameOnly = Path.GetFileNameWithoutExtension(safeFilename);
-                string ext = Path.GetExtension(safeFilename);
+                string extOnly = Path.GetExtension(safeFilename);
                 while (File.Exists(attachmentPath))
                 {
-                    attachmentPath = Path.Combine(dirPath, $"{nameOnly}_{counter}{ext}");
+                    attachmentPath = Path.Combine(dirPath, $"{nameOnly}_{counter}{extOnly}");
                     counter++;
+                }
+
+                byte[] attachmentData = Array.Empty<byte>();
+
+                if (hasInlineData)
+                {
+                    attachmentData = DecodeBase64Url(part.Body!.Data!);
+                }
+                else if (hasAttachmentId)
+                {
+                    var attachmentId = part.Body!.AttachmentId!;
+                    var attachmentRequest = gmailService.Users.Messages.Attachments.Get("me", message.Id, attachmentId);
+                    var attachment = await attachmentRequest.ExecuteAsync();
+                    if (attachment?.Data == null)
+                    {
+                        _logger.LogWarning($"Attachment {filename} returned empty data for message {message.Id}");
+                        continue;
+                    }
+
+                    attachmentData = DecodeBase64Url(attachment.Data);
+                }
+
+                if (attachmentData.Length == 0)
+                {
+                    _logger.LogWarning($"Attachment {filename} from message {message.Id} is empty, skipping.");
+                    continue;
+                }
+
+                // Check size limit
+                if (attachmentData.Length > _maxAttachmentBytes)
+                {
+                    _logger.LogWarning($"Attachment {filename} exceeds size limit ({attachmentData.Length} bytes > {_maxAttachmentBytes} bytes). Skipping.");
+                    continue;
                 }
 
                 await File.WriteAllBytesAsync(attachmentPath, attachmentData);
                 attachments.Add((attachmentPath, attachmentData.Length));
 
-                _logger.LogDebug($"Downloaded attachment {part.Filename} ({attachmentData.Length} bytes)");
+                _logger.LogInfo($"Downloaded attachment {filename} -> {attachmentPath} ({attachmentData.Length} bytes)");
             }
             catch (Exception ex)
             {
@@ -132,6 +179,24 @@ public class EmailStorage
         }
 
         return attachments;
+    }
+
+    private static string GetExtensionFromMime(string mime)
+    {
+        if (string.IsNullOrWhiteSpace(mime)) return string.Empty;
+
+        // Minimal mapping for common types
+        return mime.ToLowerInvariant() switch
+        {
+            "application/pdf" => ".pdf",
+            "image/jpeg" => ".jpg",
+            "image/jpg" => ".jpg",
+            "image/png" => ".png",
+            "image/gif" => ".gif",
+            "text/plain" => ".txt",
+            "text/html" => ".html",
+            _ => string.Empty
+        };
     }
 
     /// <summary>

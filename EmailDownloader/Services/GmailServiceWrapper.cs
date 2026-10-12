@@ -4,6 +4,7 @@ using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
 using Google.Apis.Services;
 using Google.Apis.Util.Store;
+using System.Linq;
 
 namespace EmailDownloader.Services;
 
@@ -16,6 +17,7 @@ public class GmailServiceWrapper
     private readonly AppSettings _settings;
     private readonly ConsoleLogger _logger;
     private GmailService? _gmailService;
+    private readonly Random _jitter = new();
 
     // Gmail API scopes
     private static readonly string[] Scopes =
@@ -43,6 +45,25 @@ public class GmailServiceWrapper
             var credentialsPath = _settings.GmailConfiguration.CredentialsPath;
             var tokenPath = _settings.GmailConfiguration.TokenPath;
 
+            // Resolve credentials path across common locations
+            if (!Path.IsPathRooted(credentialsPath) || !File.Exists(credentialsPath))
+            {
+                var probeCreds = new[]
+                {
+                    Path.Combine(Environment.CurrentDirectory, credentialsPath),
+                    Path.Combine(Environment.CurrentDirectory, "EmailDownloader", credentialsPath),
+                    Path.Combine(AppContext.BaseDirectory, credentialsPath),
+                    Path.Combine(AppContext.BaseDirectory, "..", "..", "..", credentialsPath),
+                    Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? AppContext.BaseDirectory, credentialsPath)
+                };
+
+                var found = probeCreds.FirstOrDefault(File.Exists);
+                if (found != null)
+                {
+                    credentialsPath = found;
+                }
+            }
+
             if (!File.Exists(credentialsPath))
             {
                 throw new FileNotFoundException(
@@ -53,12 +74,20 @@ public class GmailServiceWrapper
             // Load OAuth credentials from file
             using (var stream = new FileStream(credentialsPath, FileMode.Open, FileAccess.Read))
             {
+                var secrets = GoogleClientSecrets.FromStream(stream).Secrets;
+
+                var tokenFolder = Path.GetDirectoryName(tokenPath);
+                if (string.IsNullOrWhiteSpace(tokenFolder))
+                {
+                    tokenFolder = Path.GetDirectoryName(credentialsPath) ?? AppContext.BaseDirectory;
+                }
+
                 credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
-                    GoogleClientSecrets.FromStream(stream).Secrets,
+                    secrets,
                     Scopes,
                     "user",
                     cancellationToken,
-                    new FileDataStore(Path.GetDirectoryName(tokenPath) ?? ".", true));
+                    new FileDataStore(tokenFolder, true));
             }
 
             // Create Gmail service
@@ -77,6 +106,39 @@ public class GmailServiceWrapper
         }
     }
 
+    private int EffectiveDelayMs() => Math.Max(_settings.EmailProcessing.RequestDelayMs, (int)Math.Ceiling(60000.0 / Math.Max(1, _settings.EmailProcessing.MaxRequestsPerMinute)));
+
+    private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> action)
+    {
+        var attempts = Math.Max(1, _settings.EmailProcessing.RetryAttempts);
+        var delay = Math.Max(100, _settings.EmailProcessing.RetryDelayMs);
+
+        for (int i = 1; ; i++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex)
+            {
+                // If last attempt, rethrow
+                if (i >= attempts)
+                {
+                    throw;
+                }
+
+                // Log and back off
+                _logger.LogWarning($"Request failed (attempt {i}/{attempts}): {ex.Message}. Retrying after backoff...");
+
+                // Exponential backoff with jitter
+                var backoff = delay * (int)Math.Pow(2, i - 1);
+                var jitter = _jitter.Next(0, Math.Min(1000, backoff / 2));
+                var wait = Math.Min(backoff + jitter, 60000);
+                await Task.Delay(wait);
+            }
+        }
+    }
+
     /// <summary>
     /// Get all message IDs from the mailbox (with paging support)
     /// </summary>
@@ -90,14 +152,17 @@ public class GmailServiceWrapper
 
         try
         {
+            var maxResults = Math.Max(10, _settings.EmailProcessing.MaxResultsPerPage);
+            var delayMs = EffectiveDelayMs();
+
             do
             {
                 var request = _gmailService!.Users.Messages.List("me");
-                request.MaxResults = 500; // Max batch size for Gmail API
+                request.MaxResults = maxResults;
                 request.PageToken = pageToken;
                 request.Fields = "messages(id,threadId),nextPageToken"; // Only fetch lightweight message stubs
 
-                var response = await request.ExecuteAsync(cancellationToken);
+                var response = await ExecuteWithRetryAsync(() => request.ExecuteAsync(cancellationToken));
 
                 if (response.Messages != null)
                 {
@@ -107,6 +172,10 @@ public class GmailServiceWrapper
 
                 _logger.LogDebug($"Fetched page {pageCount}: {allMessages.Count} messages total so far...");
                 pageToken = response.NextPageToken;
+
+                // Respect rate limits by delaying between pages
+                if (pageToken != null)
+                    await Task.Delay(delayMs, cancellationToken);
 
             } while (pageToken != null);
 
@@ -131,13 +200,92 @@ public class GmailServiceWrapper
         {
             var request = _gmailService!.Users.Messages.Get("me", messageId);
             request.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Full;
-            return await request.ExecuteAsync(cancellationToken);
+
+            // Rate limit before executing
+            await Task.Delay(EffectiveDelayMs(), cancellationToken);
+
+            return await ExecuteWithRetryAsync(() => request.ExecuteAsync(cancellationToken));
         }
         catch (Exception ex)
         {
             _logger.LogError($"Failed to get message {messageId}: {ex.Message}");
             throw;
         }
+    }
+
+    /// <summary>
+    /// Return message ids that changed since a given history id using the History API
+    /// </summary>
+    public async Task<List<string>> GetMessageIdsSinceHistoryAsync(long startHistoryId, CancellationToken cancellationToken = default)
+    {
+        EnsureAuthenticated();
+        var ids = new List<string>();
+        string? pageToken = null;
+
+        try
+        {
+            do
+            {
+                var request = _gmailService!.Users.History.List("me");
+                request.StartHistoryId = (ulong)startHistoryId;
+                request.PageToken = pageToken;
+                request.Fields = "history(messagesAdded(messages(id,threadId))),nextPageToken";
+
+                var response = await ExecuteWithRetryAsync(() => request.ExecuteAsync(cancellationToken));
+                if (response.History != null)
+                {
+                    foreach (var h in response.History)
+                    {
+                        if (h.MessagesAdded != null)
+                        {
+                            foreach (var ma in h.MessagesAdded)
+                            {
+                                if (ma.Message != null && !string.IsNullOrWhiteSpace(ma.Message.Id))
+                                    ids.Add(ma.Message.Id);
+                            }
+                        }
+                    }
+                }
+
+                pageToken = response.NextPageToken;
+                if (pageToken != null)
+                    await Task.Delay(EffectiveDelayMs(), cancellationToken);
+
+            } while (pageToken != null);
+
+            return ids.Distinct().ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning($"History API failed: {ex.Message}. Falling back to full listing.");
+            return new List<string>();
+        }
+    }
+
+    /// <summary>
+    /// Get current profile history id (if available)
+    /// </summary>
+    public async Task<long?> GetCurrentHistoryIdAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureAuthenticated();
+        try
+        {
+            var profile = await ExecuteWithRetryAsync(() => _gmailService!.Users.GetProfile("me").ExecuteAsync(cancellationToken));
+            if (profile.HistoryId != null)
+            {
+                try
+                {
+                    return (long)profile.HistoryId.Value;
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning($"Failed to get profile/history id: {ex.Message}");
+        }
+
+        return null;
     }
 
     /// <summary>

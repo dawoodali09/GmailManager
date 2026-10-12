@@ -32,6 +32,10 @@ public class EmailProcessing
     public int MaxAttachmentSizeMB { get; set; } = 50;
     public int RetryAttempts { get; set; } = 3;
     public int RetryDelayMs { get; set; } = 1000;
+    // Controls for API rate limiting and paging
+    public int MaxResultsPerPage { get; set; } = 100;
+    public int RequestDelayMs { get; set; } = 200; // delay between requests to avoid quota spikes
+    public int MaxRequestsPerMinute { get; set; } = 300; // soft limit per minute
 }
 
 public class ClassificationRules

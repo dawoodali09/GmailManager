@@ -102,71 +102,139 @@ public class EmailProcessor
     /// </summary>
     private async Task FetchAndDownloadNewEmailsAsync(CancellationToken cancellationToken)
     {
-        var allMessages = await _gmailService.FetchAllMessagesAsync(cancellationToken);
+        // Try incremental sync using Gmail History API if we have a saved history id
+        var lastHistoryId = _metadataRepo.LoadLastHistoryId();
+        List<string> messageIds = new();
 
-        foreach (var msgStub in allMessages)
+        if (lastHistoryId.HasValue)
         {
-            if (cancellationToken.IsCancellationRequested)
-                break;
-
-            try
+            _logger.LogInfo($"Performing incremental sync since history id {lastHistoryId.Value}...");
+            var ids = await _gmailService.GetMessageIdsSinceHistoryAsync(lastHistoryId.Value, cancellationToken);
+            if (ids != null && ids.Count > 0)
+                messageIds.AddRange(ids);
+            else
             {
-                // Skip if already in metadata
-                if (_metadataRepo.Exists(msgStub.Id))
-                    continue;
+                _logger.LogDebug("History API returned no changes or failed; falling back to full listing.");
+                var all = await _gmailService.FetchAllMessagesAsync(cancellationToken);
+                messageIds.AddRange(all.Select(m => m.Id));
+            }
+        }
+        else
+        {
+            var allMessages = await _gmailService.FetchAllMessagesAsync(cancellationToken);
+            messageIds.AddRange(allMessages.Select(m => m.Id));
+        }
 
-                _totalNewEmails++;
+        // Start a heartbeat task to report progress periodically
+        var heartbeatIntervalMs = 15000; // 15s
+        var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeatTask = Task.Run(async () =>
+        {
+            while (!heartbeatCts.Token.IsCancellationRequested)
+            {
+                _logger.LogInfo($"Heartbeat: total discovered={messageIds.Count}, new={_totalNewEmails}, downloaded={_totalDownloaded}, errors={_totalErrors}");
+                try { await Task.Delay(heartbeatIntervalMs, heartbeatCts.Token); } catch { }
+            }
+        }, heartbeatCts.Token);
 
-                // Fetch full message details
-                var fullMessage = await _gmailService.GetMessageAsync(msgStub.Id, cancellationToken);
-                var (senderEmail, senderName) = GmailServiceWrapper.ExtractSenderInfo(fullMessage);
-                var subject = GmailServiceWrapper.ExtractSubject(fullMessage);
-                var receivedDate = GmailServiceWrapper.ExtractReceivedDate(fullMessage);
-                var recipients = GmailServiceWrapper.ExtractRecipients(fullMessage);
+        try
+        {
+            for (int index = 0; index < messageIds.Count; index++)
+            {
+                var msgId = messageIds[index];
 
-                // Classify email
-                var classification = _classifier.Classify(fullMessage, senderEmail, senderName);
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
-                // Track stats
-                if (classification.HasAttachment)
-                    _totalWithAttachments++;
-                if (classification.ContainsUnsubscribe)
-                    _totalWithUnsubscribe++;
-                if (classification.MatchingNaughtySender != null)
-                    _totalNaughtySenders++;
-
-                // Download email and attachments
-                string localPath = await _emailStorage.DownloadEmailAsync(_gmailService.GetService(), msgStub.Id);
-                await _emailStorage.DownloadAttachmentsAsync(_gmailService.GetService(), fullMessage);
-                _totalDownloaded++;
-
-                // Create metadata record
-                var metadata = new EmailMetadata
+                try
                 {
-                    MessageId = msgStub.Id,
-                    ThreadId = msgStub.ThreadId ?? string.Empty,
-                    Subject = subject,
-                    Sender = senderEmail,
-                    Recipients = recipients,
-                    ReceivedDate = receivedDate,
-                    HasAttachment = classification.HasAttachment,
-                    Important = classification.IsImportant,
-                    Processed = false, // Will be processed in next phase
-                    LocalPath = localPath
-                };
+                    // Skip if already in metadata
+                    if (_metadataRepo.Exists(msgId))
+                        continue;
 
-                _metadataRepo.AddOrUpdate(metadata);
+                    _totalNewEmails++;
 
-                _logger.LogDebug($"Downloaded: {subject} from {senderEmail}");
+                    _logger.LogInfo($"Processing {index + 1}/{messageIds.Count}: message id {msgId}");
+
+                    // Fetch full message details
+                    var fullMessage = await _gmailService.GetMessageAsync(msgId, cancellationToken);
+                    var (senderEmail, senderName) = GmailServiceWrapper.ExtractSenderInfo(fullMessage);
+                    var subject = GmailServiceWrapper.ExtractSubject(fullMessage);
+                    var receivedDate = GmailServiceWrapper.ExtractReceivedDate(fullMessage);
+                    var recipients = GmailServiceWrapper.ExtractRecipients(fullMessage);
+
+                    // Classify email
+                    var classification = _classifier.Classify(fullMessage, senderEmail, senderName);
+
+                    // Track stats
+                    if (classification.HasAttachment)
+                        _totalWithAttachments++;
+                    if (classification.ContainsUnsubscribe)
+                        _totalWithUnsubscribe++;
+                    if (classification.MatchingNaughtySender != null)
+                        _totalNaughtySenders++;
+
+                    // Download email and attachments
+                    string localPath = await _emailStorage.DownloadEmailAsync(_gmailService.GetService(), msgId);
+                    var downloadedAttachments = await _emailStorage.DownloadAttachmentsAsync(_gmailService.GetService(), fullMessage);
+                    _totalDownloaded++;
+
+                    // Informative log: where the message and attachments were saved
+                    _logger.LogInfo($"Saved message: {subject} | Id: {msgId} -> {localPath}");
+                    foreach (var (path, size) in downloadedAttachments)
+                    {
+                        _logger.LogInfo($"Saved attachment: {Path.GetFileName(path)} -> {path} ({size} bytes)");
+                    }
+
+                    // Create metadata record
+                    var metadata = new EmailMetadata
+                    {
+                        MessageId = msgId,
+                        ThreadId = fullMessage.ThreadId ?? string.Empty,
+                        Subject = subject,
+                        Sender = senderEmail,
+                        Recipients = recipients,
+                        ReceivedDate = receivedDate,
+                        HasAttachment = classification.HasAttachment,
+                        Important = classification.IsImportant,
+                        Processed = false, // Will be processed in next phase
+                        LocalPath = localPath
+                    };
+
+                    _metadataRepo.AddOrUpdate(metadata);
+
+                    _logger.LogDebug($"Downloaded: {subject} from {senderEmail}");
+                    _logger.LogInfo($"Completed {index + 1}/{messageIds.Count}: {subject} (id {msgId}) saved to {localPath}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Failed to process message {msgId}: {ex.Message}");
+                    _totalErrors++;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"Failed to process message {msgStub.Id}: {ex.Message}");
-                _totalErrors++;
-            }
+        }
+        finally
+        {
+            heartbeatCts.Cancel();
+            try { await heartbeatTask; } catch { }
+            heartbeatCts.Dispose();
         }
 
         _logger.LogInfo($"Found {_totalNewEmails} new emails, downloaded {_totalDownloaded}");
+        // Persist latest history id for incremental syncs
+        try
+        {
+            var currentHistory = await _gmailService.GetCurrentHistoryIdAsync(cancellationToken);
+            if (currentHistory.HasValue)
+            {
+                _metadataRepo.SaveLastHistoryId(currentHistory.Value);
+                _logger.LogDebug($"Updated saved history id to {currentHistory.Value}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning($"Failed to update history id: {ex.Message}");
+        }
     }
 
     /// <summary>

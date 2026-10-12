@@ -20,18 +20,38 @@ class Program
         try
         {
             // Load configuration from appsettings.json
-            var settings = LoadSettings();
+             var settings = LoadSettings();
             var logger = new ConsoleLogger(settings.ApplicationConfiguration.LoggingLevel);
 
             logger.LogInfo("╔════════════════════════════════════════════════════════╗");
             logger.LogInfo("║    Email Manager - Gmail Download & Classification    ║");
             logger.LogInfo("╚════════════════════════════════════════════════════════╝");
 
-            // Validate configuration
-            if (!File.Exists(settings.GmailConfiguration.CredentialsPath))
+            // Validate configuration - resolve credentials path from several common locations
+            var credentialsPath = settings.GmailConfiguration.CredentialsPath;
+            if (!Path.IsPathRooted(credentialsPath) || !File.Exists(credentialsPath))
+            {
+                var probeCreds = new[]
+                {
+                    Path.Combine(Environment.CurrentDirectory, credentialsPath),
+                    Path.Combine(Environment.CurrentDirectory, "EmailDownloader", credentialsPath),
+                    Path.Combine(AppContext.BaseDirectory, credentialsPath),
+                    Path.Combine(AppContext.BaseDirectory, "..", "..", "..", credentialsPath), // project dir when running from bin/*/net*/
+                    Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? AppContext.BaseDirectory, credentialsPath)
+                };
+
+                var foundCred = probeCreds.FirstOrDefault(File.Exists);
+                if (foundCred != null)
+                {
+                    credentialsPath = foundCred;
+                }
+            }
+
+            if (!File.Exists(credentialsPath))
             {
                 logger.LogError($"Credentials file not found: {settings.GmailConfiguration.CredentialsPath}");
-                logger.LogError("Please download credentials.json from Google Cloud Console and place it in the project directory.");
+                logger.LogError($"Searched: {Path.GetFullPath(settings.GmailConfiguration.CredentialsPath)}; {Path.Combine(AppContext.BaseDirectory, settings.GmailConfiguration.CredentialsPath)}; {Path.Combine(Environment.CurrentDirectory, settings.GmailConfiguration.CredentialsPath)}");
+                logger.LogError("Please download credentials.json from Google Cloud Console and place it in the project directory or update the path in appsettings.json.");
                 return;
             }
 
@@ -43,7 +63,8 @@ class Program
             var emailStorage = new EmailStorage(
                 settings.ApplicationConfiguration.EmailStoragePath,
                 settings.EmailProcessing.MaxAttachmentSizeMB,
-                logger);
+                logger,
+                settings.EmailProcessing);
 
             var metadataRepo = new MetadataRepository(
                 settings.ApplicationConfiguration.EmailStoragePath,
@@ -92,34 +113,70 @@ class Program
     /// </summary>
     static AppSettings LoadSettings()
     {
-        const string settingsFile = "appsettings.json";
+        const string settingsFileName = "appsettings.json";
 
-        if (!File.Exists(settingsFile))
+        // Try a few common locations: current working directory and the application base directory
+        var probePaths = new[]
+        {
+            Path.Combine(Environment.CurrentDirectory, settingsFileName),
+            Path.Combine(AppContext.BaseDirectory, settingsFileName)
+        };
+
+        var foundPath = probePaths.FirstOrDefault(File.Exists);
+        if (foundPath == null)
         {
             throw new FileNotFoundException(
-                $"Configuration file '{settingsFile}' not found. " +
-                $"Please copy 'appsettings.example.json' to '{settingsFile}' and update the values.");
+                $"Configuration file '{settingsFileName}' not found. " +
+                $"Please copy 'appsettings.example.json' to '{settingsFileName}' and update the values. " +
+                $"(Searched: {string.Join(", ", probePaths)})");
         }
 
         try
         {
-            var json = File.ReadAllText(settingsFile);
-            var settings = JsonSerializer.Deserialize<AppSettings>(json, new JsonSerializerOptions 
-            { 
-                PropertyNameCaseInsensitive = true 
-            });
-
-            if (settings == null)
+            var json = File.ReadAllText(foundPath);
+            try
             {
-                throw new InvalidOperationException("Failed to deserialize appsettings.json");
-            }
+                var settings = JsonSerializer.Deserialize<AppSettings>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
 
-            return settings;
+                if (settings == null)
+                {
+                    throw new InvalidOperationException($"Failed to deserialize {foundPath}");
+                }
+
+                return settings;
+            }
+            catch (JsonException)
+            {
+                // Attempt a simple sanitization for common accidental duplication at start of file
+                // e.g. files that start with "{{" instead of "{" (caused by earlier incorrect copy)
+                var trimmed = json.TrimStart();
+                while (trimmed.StartsWith("{{"))
+                {
+                    // remove one of the duplicate opening braces
+                    trimmed = trimmed.Substring(1);
+                }
+
+                // Try deserialize again with sanitized content
+                var settings = JsonSerializer.Deserialize<AppSettings>(trimmed, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                if (settings == null)
+                {
+                    throw new InvalidOperationException($"Failed to deserialize {foundPath} after sanitization");
+                }
+
+                return settings;
+            }
         }
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"Invalid JSON in '{settingsFile}': {ex.Message}", ex);
+                $"Invalid JSON in '{foundPath}': {ex.Message}", ex);
         }
     }
 }

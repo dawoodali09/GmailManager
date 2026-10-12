@@ -25,13 +25,13 @@ public class ConsoleLogger
     public void LogDebug(string message)
     {
         if (_minLevel <= LogLevel.Debug)
-            Console.WriteLine($"[DEBUG] {message}");
+            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][DEBUG] {message}");
     }
 
     public void LogInfo(string message)
     {
         if (_minLevel <= LogLevel.Info)
-            Console.WriteLine($"[INFO]  {message}");
+            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][INFO]  {message}");
     }
 
     public void LogWarning(string message)
@@ -39,7 +39,7 @@ public class ConsoleLogger
         if (_minLevel <= LogLevel.Warning)
             Console.ForegroundColor = ConsoleColor.Yellow;
         if (_minLevel <= LogLevel.Warning)
-            Console.WriteLine($"[WARN]  {message}");
+            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][WARN]  {message}");
         Console.ResetColor();
     }
 
@@ -48,7 +48,7 @@ public class ConsoleLogger
         if (_minLevel <= LogLevel.Error)
             Console.ForegroundColor = ConsoleColor.Red;
         if (_minLevel <= LogLevel.Error)
-            Console.WriteLine($"[ERROR] {message}");
+            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][ERROR] {message}");
         Console.ResetColor();
     }
 

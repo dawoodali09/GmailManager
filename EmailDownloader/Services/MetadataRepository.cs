@@ -14,10 +14,14 @@ public class MetadataRepository
     private readonly string _csvPath;
     private readonly ConsoleLogger _logger;
     private readonly Dictionary<string, EmailMetadata> _metadata;
+        private readonly string _storagePath;
+        private readonly string _historyPath;
 
     public MetadataRepository(string storagePath, string csvFileName, ConsoleLogger logger)
     {
+        _storagePath = storagePath;
         _csvPath = Path.Combine(storagePath, csvFileName);
+        _historyPath = Path.Combine(storagePath, "last_history_id.txt");
         _logger = logger;
         _metadata = new Dictionary<string, EmailMetadata>();
     }
@@ -143,6 +147,41 @@ public class MetadataRepository
         {
             metadata.Processed = true;
             metadata.LastModified = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// Load last saved history id used for incremental sync (if any)
+    /// </summary>
+    public long? LoadLastHistoryId()
+    {
+        try
+        {
+            if (!File.Exists(_historyPath)) return null;
+            var txt = File.ReadAllText(_historyPath).Trim();
+            if (long.TryParse(txt, out var val)) return val;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning($"Failed to read history id: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Save last history id for future incremental syncs
+    /// </summary>
+    public void SaveLastHistoryId(long historyId)
+    {
+        try
+        {
+            File.WriteAllText(_historyPath, historyId.ToString());
+            _logger.LogDebug($"Saved last history id: {historyId}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning($"Failed to save history id: {ex.Message}");
         }
     }
 }

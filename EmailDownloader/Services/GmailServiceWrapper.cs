@@ -1,4 +1,5 @@
 using EmailDownloader.Configuration;
+using Google;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
@@ -121,6 +122,12 @@ public class GmailServiceWrapper
             }
             catch (Exception ex)
             {
+                if (IsQuotaExceeded(ex))
+                {
+                    _logger.LogWarning("Gmail API quota/rate limit reached. Ending current run and deferring to next scheduled run.");
+                    throw new GmailQuotaExceededException("Gmail API quota/rate limit exceeded.", ex);
+                }
+
                 // If last attempt, rethrow
                 if (i >= attempts)
                 {
@@ -137,6 +144,32 @@ public class GmailServiceWrapper
                 await Task.Delay(wait);
             }
         }
+    }
+
+    private static bool IsQuotaExceeded(Exception ex)
+    {
+        if (ex is GmailQuotaExceededException)
+        {
+            return true;
+        }
+
+        if (ex is GoogleApiException googleEx)
+        {
+            var code = googleEx.HttpStatusCode;
+            if ((int)code == 429)
+            {
+                return true;
+            }
+
+            var reasons = googleEx.Error?.Errors?.Select(e => e.Reason?.ToLowerInvariant()).Where(r => !string.IsNullOrWhiteSpace(r)).ToList() ?? new List<string>();
+            if (reasons.Any(r => r is "ratelimitexceeded" or "userratelimitexceeded" or "quotaexceeded" or "dailylimitexceeded"))
+            {
+                return true;
+            }
+        }
+
+        var msg = ex.Message.ToLowerInvariant();
+        return msg.Contains("quota") || msg.Contains("rate limit") || msg.Contains("too many requests");
     }
 
     /// <summary>
@@ -187,6 +220,45 @@ public class GmailServiceWrapper
             _logger.LogError($"Failed to fetch messages: {ex.Message}");
             throw;
         }
+    }
+
+    /// <summary>
+    /// Stream mailbox message stubs page by page so callers can start work before the full listing completes
+    /// </summary>
+    public async IAsyncEnumerable<List<Message>> ListMessagePagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        EnsureAuthenticated();
+
+        string? pageToken = null;
+        int pageCount = 0;
+        int total = 0;
+        var maxResults = Math.Max(10, _settings.EmailProcessing.MaxResultsPerPage);
+        var delayMs = EffectiveDelayMs();
+
+        do
+        {
+            var request = _gmailService!.Users.Messages.List("me");
+            request.MaxResults = maxResults;
+            request.PageToken = pageToken;
+            request.Fields = "messages(id,threadId),nextPageToken";
+
+            var response = await ExecuteWithRetryAsync(() => request.ExecuteAsync(cancellationToken));
+            pageToken = response.NextPageToken;
+            pageCount++;
+
+            var page = response.Messages?.ToList() ?? new List<Message>();
+            total += page.Count;
+            _logger.LogInfo($"Listing mailbox: page {pageCount}, {total} messages discovered so far");
+
+            if (page.Count > 0)
+                yield return page;
+
+            if (pageToken != null)
+                await Task.Delay(delayMs, cancellationToken);
+
+        } while (pageToken != null);
+
+        _logger.LogInfo($"Mailbox listing complete: {total} messages across {pageCount} pages");
     }
 
     /// <summary>
@@ -257,6 +329,9 @@ public class GmailServiceWrapper
         }
         catch (Exception ex)
         {
+            if (ex is GmailQuotaExceededException)
+                throw;
+
             _logger.LogWarning($"History API failed: {ex.Message}. Falling back to full listing.");
             return new List<string>();
         }

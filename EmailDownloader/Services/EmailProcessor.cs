@@ -25,6 +25,7 @@ public class EmailProcessor
     private readonly EmailClassifier _classifier;
 
     private int _totalNewEmails;
+    private int _totalDiscovered;
     private int _totalDownloaded;
     private int _totalProcessed;
     private int _totalDeleted;
@@ -68,6 +69,8 @@ public class EmailProcessor
             // Step 1: Load existing metadata
             _logger.LogInfo("Step 1/4: Loading existing metadata...");
             await _metadataRepo.LoadAsync();
+            foreach (var m in _metadataRepo.GetAll())
+                m.PushToSec = ComputePushToSec(m.Important, m.HasAttachment, m.Sender);
 
             // Step 2: Authenticate with Gmail
             _logger.LogInfo("Step 2/4: Authenticating with Gmail...");
@@ -104,25 +107,26 @@ public class EmailProcessor
     {
         // Try incremental sync using Gmail History API if we have a saved history id
         var lastHistoryId = _metadataRepo.LoadLastHistoryId();
-        List<string> messageIds = new();
+        long? startHistoryId = null;
+        try { startHistoryId = await _gmailService.GetCurrentHistoryIdAsync(cancellationToken); }
+        catch (Exception ex) { _logger.LogWarning($"Could not read current history id: {ex.Message}"); }
 
-        if (lastHistoryId.HasValue)
+        async IAsyncEnumerable<List<string>> GetIdBatchesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
-            _logger.LogInfo($"Performing incremental sync since history id {lastHistoryId.Value}...");
-            var ids = await _gmailService.GetMessageIdsSinceHistoryAsync(lastHistoryId.Value, cancellationToken);
-            if (ids != null && ids.Count > 0)
-                messageIds.AddRange(ids);
-            else
+            if (lastHistoryId.HasValue)
             {
+                _logger.LogInfo($"Performing incremental sync since history id {lastHistoryId.Value}...");
+                var ids = await _gmailService.GetMessageIdsSinceHistoryAsync(lastHistoryId.Value, ct);
+                if (ids != null && ids.Count > 0)
+                {
+                    yield return ids.ToList();
+                    yield break;
+                }
                 _logger.LogDebug("History API returned no changes or failed; falling back to full listing.");
-                var all = await _gmailService.FetchAllMessagesAsync(cancellationToken);
-                messageIds.AddRange(all.Select(m => m.Id));
             }
-        }
-        else
-        {
-            var allMessages = await _gmailService.FetchAllMessagesAsync(cancellationToken);
-            messageIds.AddRange(allMessages.Select(m => m.Id));
+
+            await foreach (var page in _gmailService.ListMessagePagesAsync(ct))
+                yield return page.Select(m => m.Id).ToList();
         }
 
         // Start a heartbeat task to report progress periodically
@@ -132,13 +136,16 @@ public class EmailProcessor
         {
             while (!heartbeatCts.Token.IsCancellationRequested)
             {
-                _logger.LogInfo($"Heartbeat: total discovered={messageIds.Count}, new={_totalNewEmails}, downloaded={_totalDownloaded}, errors={_totalErrors}");
+                _logger.LogInfo($"Heartbeat: total discovered={_totalDiscovered}, new={_totalNewEmails}, downloaded={_totalDownloaded}, errors={_totalErrors}");
                 try { await Task.Delay(heartbeatIntervalMs, heartbeatCts.Token); } catch { }
             }
         }, heartbeatCts.Token);
 
         try
         {
+            await foreach (var messageIds in GetIdBatchesAsync(cancellationToken))
+            {
+            _totalDiscovered += messageIds.Count;
             for (int index = 0; index < messageIds.Count; index++)
             {
                 var msgId = messageIds[index];
@@ -196,21 +203,29 @@ public class EmailProcessor
                         Recipients = recipients,
                         ReceivedDate = receivedDate,
                         HasAttachment = classification.HasAttachment,
+                        PushToSec = ComputePushToSec(classification.IsImportant,
+                            classification.HasAttachment || (fullMessage.Payload?.Parts?.Any(p => !string.IsNullOrWhiteSpace(p.Filename)) ?? false),
+                            senderEmail, senderName),
                         Important = classification.IsImportant,
                         Processed = false, // Will be processed in next phase
                         LocalPath = localPath
                     };
 
                     _metadataRepo.AddOrUpdate(metadata);
+                    await _metadataRepo.SaveAsync();
 
                     _logger.LogDebug($"Downloaded: {subject} from {senderEmail}");
                     _logger.LogInfo($"Completed {index + 1}/{messageIds.Count}: {subject} (id {msgId}) saved to {localPath}");
                 }
                 catch (Exception ex)
                 {
+                    if (ex is GmailQuotaExceededException)
+                        throw;
+
                     _logger.LogWarning($"Failed to process message {msgId}: {ex.Message}");
                     _totalErrors++;
                 }
+            }
             }
         }
         finally
@@ -224,7 +239,7 @@ public class EmailProcessor
         // Persist latest history id for incremental syncs
         try
         {
-            var currentHistory = await _gmailService.GetCurrentHistoryIdAsync(cancellationToken);
+            var currentHistory = startHistoryId;
             if (currentHistory.HasValue)
             {
                 _metadataRepo.SaveLastHistoryId(currentHistory.Value);
@@ -235,6 +250,13 @@ public class EmailProcessor
         {
             _logger.LogWarning($"Failed to update history id: {ex.Message}");
         }
+    }
+
+    private static bool ComputePushToSec(bool important, bool hasAttachment, params string?[] senders)
+    {
+        if (important || hasAttachment) return true;
+        return senders.Any(s => !string.IsNullOrEmpty(s) &&
+            (s.Contains("dawood", StringComparison.OrdinalIgnoreCase) || s.Contains("wajeeha", StringComparison.OrdinalIgnoreCase)));
     }
 
     /// <summary>
@@ -261,6 +283,7 @@ public class EmailProcessor
                 // Update metadata with classification results
                 metadata.Important = classification.IsImportant;
                 metadata.HasAttachment = classification.HasAttachment;
+                metadata.PushToSec = ComputePushToSec(metadata.Important, metadata.HasAttachment, senderEmail, senderName);
                 metadata.Sender = senderEmail; // Update in case it changed
 
                 bool shouldDelete = false;
@@ -297,6 +320,7 @@ public class EmailProcessor
 
                 // Mark as processed
                 _metadataRepo.MarkAsProcessed(metadata.MessageId);
+                await _metadataRepo.SaveAsync();
                 _totalProcessed++;
 
                 if (metadata.Important)
@@ -306,6 +330,9 @@ public class EmailProcessor
             }
             catch (Exception ex)
             {
+                if (ex is GmailQuotaExceededException)
+                    throw;
+
                 _logger.LogWarning($"Failed to process email {metadata.MessageId}: {ex.Message}");
                 _totalErrors++;
             }

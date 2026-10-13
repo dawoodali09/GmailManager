@@ -16,6 +16,7 @@ public class EmailMetadata
     public bool Processed { get; set; }
     public string LocalPath { get; set; } = string.Empty;
     public DateTime LastModified { get; set; } = DateTime.UtcNow;
+    public bool PushToSec { get; set; }
 }
 
 /// <summary>

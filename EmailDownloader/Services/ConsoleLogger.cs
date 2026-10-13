@@ -14,42 +14,40 @@ public class ConsoleLogger
     }
 
     private readonly LogLevel _minLevel;
+    private readonly Action<string>? _messageSink;
+    private readonly bool _writeToConsole;
 
-    public ConsoleLogger(string? levelName = "Info")
+    public ConsoleLogger(string? levelName = "Info", Action<string>? messageSink = null, bool writeToConsole = true)
     {
         _minLevel = Enum.TryParse<LogLevel>(levelName, ignoreCase: true, out var level) 
             ? level 
             : LogLevel.Info;
+        _messageSink = messageSink;
+        _writeToConsole = writeToConsole;
     }
 
     public void LogDebug(string message)
     {
         if (_minLevel <= LogLevel.Debug)
-            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][DEBUG] {message}");
+            Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}][DEBUG] {message}");
     }
 
     public void LogInfo(string message)
     {
         if (_minLevel <= LogLevel.Info)
-            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][INFO]  {message}");
+            Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}][INFO]  {message}");
     }
 
     public void LogWarning(string message)
     {
         if (_minLevel <= LogLevel.Warning)
-            Console.ForegroundColor = ConsoleColor.Yellow;
-        if (_minLevel <= LogLevel.Warning)
-            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][WARN]  {message}");
-        Console.ResetColor();
+            Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}][WARN]  {message}", ConsoleColor.Yellow);
     }
 
     public void LogError(string message)
     {
         if (_minLevel <= LogLevel.Error)
-            Console.ForegroundColor = ConsoleColor.Red;
-        if (_minLevel <= LogLevel.Error)
-            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}][ERROR] {message}");
-        Console.ResetColor();
+            Write($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}][ERROR] {message}", ConsoleColor.Red);
     }
 
     /// <summary>
@@ -57,8 +55,22 @@ public class ConsoleLogger
     /// </summary>
     public void LogSuccess(string message)
     {
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"[OK]    {message}");
-        Console.ResetColor();
+        Write($"[OK]    {message}", ConsoleColor.Green);
+    }
+
+    private void Write(string line, ConsoleColor? color = null)
+    {
+        if (_writeToConsole)
+        {
+            if (color.HasValue)
+            {
+                Console.ForegroundColor = color.Value;
+            }
+
+            Console.WriteLine(line);
+            Console.ResetColor();
+        }
+
+        _messageSink?.Invoke(line);
     }
 }

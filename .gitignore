@@ -49,3 +49,7 @@ TestResults/
 
 # ReSharper
 .resharper*
+
+Installer/publish/
+Installer/Output/
+*TokenResponse-user

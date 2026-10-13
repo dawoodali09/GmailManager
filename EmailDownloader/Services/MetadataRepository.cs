@@ -44,6 +44,7 @@ public class MetadataRepository
             {
                 HasHeaderRecord = true,
                 TrimOptions = TrimOptions.Trim,
+                MissingFieldFound = null,
                 BadDataFound = context => _logger.LogWarning($"Bad CSV data: {context.RawRecord}")
             }))
             {
@@ -67,6 +68,8 @@ public class MetadataRepository
     /// Check if a message ID already exists in metadata
     /// </summary>
     public bool Exists(string messageId) => _metadata.ContainsKey(messageId);
+
+    public IEnumerable<EmailMetadata> GetAll() => _metadata.Values;
 
     /// <summary>
     /// Get metadata for a specific message
